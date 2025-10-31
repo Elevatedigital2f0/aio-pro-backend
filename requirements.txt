@@ -1,8 +1,6 @@
 fastapi
 uvicorn
 httpx
-beautifulsoup4
 pydantic
+beautifulsoup4
 lxml
-playwright
-playwright-stealth
