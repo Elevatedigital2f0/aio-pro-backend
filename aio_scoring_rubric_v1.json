@@ -1,0 +1,22 @@
+{
+  "weights": {
+    "TechnicalUX": 0.2,
+    "Transparency": 0.2,
+    "Authority": 0.2,
+    "DataAccessibility": 0.2,
+    "BrandCoherence": 0.1,
+    "HumanProof": 0.1
+  },
+  "meta": {
+    "version": "1.0.0",
+    "description": "AI Visibility Rubric (short form)"
+  },
+  "pillars": [
+    "TechnicalUX",
+    "Transparency",
+    "Authority",
+    "DataAccessibility",
+    "BrandCoherence",
+    "HumanProof"
+  ]
+}

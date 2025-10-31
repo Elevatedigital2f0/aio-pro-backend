@@ -1,0 +1,31 @@
+
+openapi: 3.1.0
+info:
+  title: AIO Pro Backend
+  version: "0.1.0"
+servers:
+  - url: https://YOUR-RENDER-URL.onrender.com
+paths:
+  /crawl_site:
+    post:
+      summary: Crawl a site
+      operationId: crawl_site
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                start_url: { type: string }
+                max_pages: { type: integer }
+              required: [start_url]
+      responses:
+        '200': { description: OK }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
