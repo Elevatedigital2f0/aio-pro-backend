@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 httpx
-pydantic
 beautifulsoup4
-lxml
+pydantic
