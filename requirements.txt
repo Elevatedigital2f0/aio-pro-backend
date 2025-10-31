@@ -3,4 +3,6 @@ uvicorn
 httpx
 beautifulsoup4
 pydantic
+lxml
 playwright
+playwright-stealth
