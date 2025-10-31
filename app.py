@@ -1,160 +1,230 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl
+from typing import List, Set, Tuple
+from urllib.parse import urljoin, urlparse, urldefrag
 import httpx
-from lxml import etree
+from bs4 import BeautifulSoup
+import asyncio
+import re
 
-app = FastAPI()
+app = FastAPI(title="AIO Pro Backend", version="1.3.1")
+
+# ---------- Models ----------
 
 class CrawlRequest(BaseModel):
-    start_url: str
-    max_pages: int = 500
+    start_url: HttpUrl
+    max_pages: int = 100
+
+class CrawlResult(BaseModel):
+    url: HttpUrl
+    link_count: int
+    links: List[HttpUrl]
+
+
+# ---------- Helpers ----------
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36 AIO-Visibility-Optimiser"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+SITEMAP_CANDIDATES = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/wp-sitemap.xml",
+    "/post-sitemap.xml",
+    "/page-sitemap.xml",
+    "/feed/sitemap.xml",
+]
+
+WORDPRESS_REST_PAGES = "/wp-json/wp/v2/pages?per_page=100"
+WORDPRESS_REST_POSTS = "/wp-json/wp/v2/posts?per_page=100"
+
+
+def same_host(url: str, host: str) -> bool:
+    return urlparse(url).netloc == host
+
+
+def normalize_url(url: str) -> str:
+    # Remove fragments and whitespace; keep https canonicalization to caller
+    url = urldefrag(url.strip())[0]
+    # Filter out non-http(s)
+    if not url.startswith("http://") and not url.startswith("https://"):
+        return ""
+    # Exclude mailto/tel/etc (double guard)
+    if re.match(r"^(mailto:|tel:|javascript:)", url, re.IGNORECASE):
+        return ""
+    return url
+
+
+def absolutize(base: str, maybe_relative: str) -> str:
+    return urljoin(base, maybe_relative)
+
+
+async def fetch_text(client: httpx.AsyncClient, url: str) -> Tuple[str, str]:
+    """Return (url, text or '') with soft error handling."""
+    try:
+        r = await client.get(url, headers=DEFAULT_HEADERS, timeout=15)
+        r.raise_for_status()
+        # Some WP endpoints return JSON; that’s ok for REST; for HTML we’ll parse conditionally
+        return url, r.text
+    except Exception:
+        return url, ""
+
+
+async def discover_sitemaps(client: httpx.AsyncClient, root: str) -> Set[str]:
+    """Try common sitemap locations + auto-discover from robots.txt."""
+    found: Set[str] = set()
+
+    # robots.txt discovery
+    robots_url = urljoin(root, "/robots.txt")
+    _, robots = await fetch_text(client, robots_url)
+    if robots:
+        for line in robots.splitlines():
+            if line.lower().startswith("sitemap:"):
+                sm = line.split(":", 1)[1].strip()
+                sm = normalize_url(sm)
+                if sm:
+                    found.add(sm)
+
+    # common locations
+    for path in SITEMAP_CANDIDATES:
+        sm_url = urljoin(root, path)
+        url_fetched, text = await fetch_text(client, sm_url)
+        if text and len(text) > 60 and "<" in text:
+            found.add(url_fetched)
+
+    return found
+
+
+def extract_urls_from_sitemap(xml_text: str) -> Set[str]:
+    """Extract <loc> URLs from a (site|index) sitemap."""
+    urls: Set[str] = set()
+    try:
+        soup = BeautifulSoup(xml_text, "xml")
+        # urlset -> url -> loc
+        for loc in soup.find_all("loc"):
+            if loc and loc.text:
+                u = normalize_url(loc.text)
+                if u:
+                    urls.add(u)
+    except Exception:
+        pass
+    return urls
+
+
+def extract_links_from_html(html: str, base_url: str, host: str) -> Set[str]:
+    """Collect internal <a href> links."""
+    links: Set[str] = set()
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href")
+            if not href:
+                continue
+            absolute = absolutize(base_url, href)
+            absolute = normalize_url(absolute)
+            if not absolute:
+                continue
+            if same_host(absolute, host):
+                links.add(absolute)
+    except Exception:
+        pass
+    return links
+
+
+async def enumerate_wordpress(client: httpx.AsyncClient, root: str, host: str) -> Set[str]:
+    """Use WP REST to list pages + posts if available."""
+    urls: Set[str] = set()
+    for endpoint in (WORDPRESS_REST_PAGES, WORDPRESS_REST_POSTS):
+        url = urljoin(root, endpoint)
+        try:
+            r = await client.get(url, headers=DEFAULT_HEADERS, timeout=15)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/json"):
+                data = r.json()
+                if isinstance(data, list):
+                    for item in data:
+                        link = item.get("link") or item.get("guid", {}).get("rendered")
+                        if link:
+                            link = normalize_url(link)
+                            if link and same_host(link, host):
+                                urls.add(link)
+        except Exception:
+            continue
+    return urls
+
+
+# ---------- Routes ----------
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok", "service": "AIO Pro Backend"}
 
-def same_domain(u, base_netloc):
-    try:
-        return urlparse(u).netloc == base_netloc
-    except:
-        return False
 
-async def get(url, client, headers=None):
-    try:
-        r = await client.get(url, headers=headers or {}, follow_redirects=True, timeout=15.0)
-        if r.status_code == 200:
-            return r
-    except:
-        pass
-    return None
-
-async def collect_from_sitemaps(base_url, client):
-    """Load sitemap_index.xml and any sub-sitemaps to collect URLs."""
-    urls = set()
-    base = base_url.rstrip("/")
-    candidates = [
-        f"{base}/sitemap_index.xml",
-        f"{base}/sitemap.xml",
-        f"{base}/post-sitemap.xml",
-        f"{base}/page-sitemap.xml",
-    ]
-    seen_xml = set()
-    async def parse_xml(xml_url):
-        if xml_url in seen_xml:
-            return
-        seen_xml.add(xml_url)
-        r = await get(xml_url, client)
-        if not r:
-            return
-        try:
-            xml = etree.fromstring(r.content)
-            locs = xml.xpath("//loc/text()")
-            for loc in locs:
-                if loc.endswith(".xml"):
-                    await parse_xml(loc)
-                else:
-                    urls.add(loc)
-        except:
-            pass
-
-    for c in candidates:
-        await parse_xml(c)
-    return urls
-
-async def collect_from_wp_rest(base_url, client):
-    """If WordPress REST is available, list pages and posts (up to pagination caps)."""
-    urls = set()
-    base = base_url.rstrip("/")
-    api_root = f"{base}/wp-json/wp/v2"
-
-    async def paged(endpoint, per_page=100, max_pages=20):
-        results = []
-        for page in range(1, max_pages + 1):
-            r = await get(f"{api_root}/{endpoint}?per_page={per_page}&page={page}", client)
-            if not r:
-                break
-            try:
-                data = r.json()
-                if not data:
-                    break
-                results.extend(data)
-                if len(data) < per_page:
-                    break
-            except:
-                break
-        return results
-
-    # Quick probe to see if REST is open:
-    probe = await get(f"{api_root}/types", client)
-    if not probe:
-        return urls  # REST closed or not WP
-
-    # Pages
-    for item in await paged("pages"):
-        link = item.get("link")
-        if link:
-            urls.add(link)
-
-    # Posts
-    for item in await paged("posts"):
-        link = item.get("link")
-        if link:
-            urls.add(link)
-
-    return urls
-
-async def collect_from_hubs(base_url, client, hub_paths=None):
-    """Lightweight HTML link scrape for key hubs (/services, /blog, etc.)."""
-    hubs = hub_paths or ["/", "/services", "/blog", "/blogs", "/about", "/contact", "/pricing", "/projects", "/case-studies"]
-    urls = set()
-    base = base_url.rstrip("/")
-    netloc = urlparse(base).netloc
-    headers = {"User-Agent": "AIO-Pro-Bot/1.0"}
-
-    for path in hubs:
-        r = await get(urljoin(base + "/", path.lstrip("/")), client, headers=headers)
-        if not r:
-            continue
-        try:
-            soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.find_all("a", href=True):
-                abs_url = urljoin(r.url, a["href"])
-                if same_domain(abs_url, netloc):
-                    urls.add(abs_url)
-        except:
-            pass
-    return urls
-
-@app.post("/crawl_site")
+@app.post("/crawl_site", response_model=CrawlResult)
 async def crawl_site(req: CrawlRequest):
-    base = req.start_url.strip()
-    if not base.startswith("http"):
-        raise HTTPException(status_code=400, detail="start_url must include http(s)://")
+    start = str(req.start_url)
+    parsed = urlparse(start)
+    if not parsed.scheme.startswith("http"):
+        raise HTTPException(status_code=400, detail="start_url must be http(s)")
 
-    netloc = urlparse(base).netloc
-    found = set()
+    host = parsed.netloc
+    max_pages = max(1, min(req.max_pages, 2000))  # sensible upper bound
 
-    async with httpx.AsyncClient() as client:
-        # 1) Try sitemaps (fast & comprehensive if available)
-        found |= await collect_from_sitemaps(base, client)
+    discovered: Set[str] = set()
+    to_visit: List[str] = []
+    visited: Set[str] = set()
 
-        # 2) Try WordPress REST (pages + posts) if exposed
-        found |= await collect_from_wp_rest(base, client)
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # 1) Always include the homepage
+        discovered.add(start)
 
-        # 3) Fallback: scrape common hubs for internal links
-        found |= await collect_from_hubs(base, client)
+        # 2) Try sitemaps
+        sitemaps = await discover_sitemaps(client, start)
+        for sm in sitemaps:
+            _, xml_text = await fetch_text(client, sm)
+            if xml_text:
+                discovered.update(
+                    u for u in extract_urls_from_sitemap(xml_text) if same_host(u, host)
+                )
 
-    # Keep only same-domain, cap to max_pages
-    same_domain_links = [u for u in found if same_domain(u, netloc)]
-    unique = []
-    seen = set()
-    for u in same_domain_links:
-        if u not in seen:
-            unique.append(u)
-            seen.add(u)
-        if len(unique) >= req.max_pages:
-            break
+        # 3) Try WordPress REST enumeration
+        discovered.update(await enumerate_wordpress(client, start, host))
 
-    return {"url": base, "link_count": len(unique), "links": unique}
+        # 4) Seed crawl queue from whatever we have so far
+        #    If we only found the homepage, we’ll still crawl it and collect nav links
+        to_visit = [u for u in discovered if same_host(u, host)]
+
+        # 5) Breadth-first crawl (light-touch)
+        while to_visit and len(discovered) < max_pages:
+            batch = []
+            while to_visit and len(batch) < 10:  # fetch up to 10 concurrently
+                url = to_visit.pop(0)
+                if url in visited:
+                    continue
+                visited.add(url)
+                batch.append(url)
+
+            if not batch:
+                break
+
+            tasks = [fetch_text(client, u) for u in batch]
+            results = await asyncio.gather(*tasks)
+
+            for page_url, text in results:
+                if not text:
+                    continue
+                # Collect internal links
+                new_links = extract_links_from_html(text, page_url, host)
+                for nl in new_links:
+                    if nl not in discovered and same_host(nl, host):
+                        discovered.add(nl)
+                        if len(discovered) < max_pages:
+                            to_visit.append(nl)
+
+    final_links = sorted(discovered)
+    return CrawlResult(url=start, link_count=len(final_links), links=final_links)
