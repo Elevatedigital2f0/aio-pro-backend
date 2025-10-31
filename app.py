@@ -1,86 +1,160 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from playwright.async_api import async_playwright
-import asyncio, re, httpx
+import httpx
 from lxml import etree
 
 app = FastAPI()
 
 class CrawlRequest(BaseModel):
     start_url: str
-    max_pages: int = 200
-    max_depth: int = 3
+    max_pages: int = 500
 
 @app.get("/health")
-async def get_health():
+def health():
     return {"status": "ok", "service": "AIO Pro Backend"}
 
-async def get_sitemap_links(sitemap_url):
-    urls = set()
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.get(sitemap_url)
-            if resp.status_code != 200:
-                return []
-            xml = etree.fromstring(resp.content)
-            sitemap_links = xml.xpath("//loc/text()")
-            for link in sitemap_links:
-                if link.endswith(".xml"):
-                    urls.update(await get_sitemap_links(link))
-                else:
-                    urls.add(link)
-        except Exception:
-            pass
-    return list(urls)
+def same_domain(u, base_netloc):
+    try:
+        return urlparse(u).netloc == base_netloc
+    except:
+        return False
 
-async def render_page(url):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent="Mozilla/5.0 (AIO Pro Bot)")
-        page = await context.new_page()
+async def get(url, client, headers=None):
+    try:
+        r = await client.get(url, headers=headers or {}, follow_redirects=True, timeout=15.0)
+        if r.status_code == 200:
+            return r
+    except:
+        pass
+    return None
+
+async def collect_from_sitemaps(base_url, client):
+    """Load sitemap_index.xml and any sub-sitemaps to collect URLs."""
+    urls = set()
+    base = base_url.rstrip("/")
+    candidates = [
+        f"{base}/sitemap_index.xml",
+        f"{base}/sitemap.xml",
+        f"{base}/post-sitemap.xml",
+        f"{base}/page-sitemap.xml",
+    ]
+    seen_xml = set()
+    async def parse_xml(xml_url):
+        if xml_url in seen_xml:
+            return
+        seen_xml.add(xml_url)
+        r = await get(xml_url, client)
+        if not r:
+            return
         try:
-            await page.goto(url, timeout=30000)
-            html = await page.content()
-        except Exception:
-            html = ""
-        await browser.close()
-        return html
+            xml = etree.fromstring(r.content)
+            locs = xml.xpath("//loc/text()")
+            for loc in locs:
+                if loc.endswith(".xml"):
+                    await parse_xml(loc)
+                else:
+                    urls.add(loc)
+        except:
+            pass
+
+    for c in candidates:
+        await parse_xml(c)
+    return urls
+
+async def collect_from_wp_rest(base_url, client):
+    """If WordPress REST is available, list pages and posts (up to pagination caps)."""
+    urls = set()
+    base = base_url.rstrip("/")
+    api_root = f"{base}/wp-json/wp/v2"
+
+    async def paged(endpoint, per_page=100, max_pages=20):
+        results = []
+        for page in range(1, max_pages + 1):
+            r = await get(f"{api_root}/{endpoint}?per_page={per_page}&page={page}", client)
+            if not r:
+                break
+            try:
+                data = r.json()
+                if not data:
+                    break
+                results.extend(data)
+                if len(data) < per_page:
+                    break
+            except:
+                break
+        return results
+
+    # Quick probe to see if REST is open:
+    probe = await get(f"{api_root}/types", client)
+    if not probe:
+        return urls  # REST closed or not WP
+
+    # Pages
+    for item in await paged("pages"):
+        link = item.get("link")
+        if link:
+            urls.add(link)
+
+    # Posts
+    for item in await paged("posts"):
+        link = item.get("link")
+        if link:
+            urls.add(link)
+
+    return urls
+
+async def collect_from_hubs(base_url, client, hub_paths=None):
+    """Lightweight HTML link scrape for key hubs (/services, /blog, etc.)."""
+    hubs = hub_paths or ["/", "/services", "/blog", "/blogs", "/about", "/contact", "/pricing", "/projects", "/case-studies"]
+    urls = set()
+    base = base_url.rstrip("/")
+    netloc = urlparse(base).netloc
+    headers = {"User-Agent": "AIO-Pro-Bot/1.0"}
+
+    for path in hubs:
+        r = await get(urljoin(base + "/", path.lstrip("/")), client, headers=headers)
+        if not r:
+            continue
+        try:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                abs_url = urljoin(r.url, a["href"])
+                if same_domain(abs_url, netloc):
+                    urls.add(abs_url)
+        except:
+            pass
+    return urls
 
 @app.post("/crawl_site")
 async def crawl_site(req: CrawlRequest):
-    start_url = req.start_url.rstrip("/")
-    domain = urlparse(start_url).netloc
-    visited, to_visit, found_links = set(), [(start_url, 0)], set()
+    base = req.start_url.strip()
+    if not base.startswith("http"):
+        raise HTTPException(status_code=400, detail="start_url must include http(s)://")
 
-    # Step 1: Try sitemap if available
-    sitemap_urls = await get_sitemap_links(start_url + "/sitemap_index.xml")
-    if sitemap_urls:
-        found_links.update([u for u in sitemap_urls if domain in u])
+    netloc = urlparse(base).netloc
+    found = set()
 
-    # Step 2: Crawl with Playwright
-    while to_visit and len(visited) < req.max_pages:
-        url, depth = to_visit.pop(0)
-        if url in visited or depth > req.max_depth:
-            continue
-        visited.add(url)
+    async with httpx.AsyncClient() as client:
+        # 1) Try sitemaps (fast & comprehensive if available)
+        found |= await collect_from_sitemaps(base, client)
 
-        html = await render_page(url)
-        if not html:
-            continue
+        # 2) Try WordPress REST (pages + posts) if exposed
+        found |= await collect_from_wp_rest(base, client)
 
-        soup = BeautifulSoup(html, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            abs_url = urljoin(url, href)
-            if urlparse(abs_url).netloc == domain:
-                found_links.add(abs_url)
-                if abs_url not in visited:
-                    to_visit.append((abs_url, depth + 1))
+        # 3) Fallback: scrape common hubs for internal links
+        found |= await collect_from_hubs(base, client)
 
-    return {
-        "url": start_url,
-        "link_count": len(found_links),
-        "links": list(found_links)
-    }
+    # Keep only same-domain, cap to max_pages
+    same_domain_links = [u for u in found if same_domain(u, netloc)]
+    unique = []
+    seen = set()
+    for u in same_domain_links:
+        if u not in seen:
+            unique.append(u)
+            seen.add(u)
+        if len(unique) >= req.max_pages:
+            break
+
+    return {"url": base, "link_count": len(unique), "links": unique}
