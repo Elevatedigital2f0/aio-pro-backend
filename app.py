@@ -1,16 +1,24 @@
 from fastapi import FastAPI, HTTPException, Body
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 from pydantic import BaseModel, HttpUrl
 from typing import List, Set, Tuple, Dict, Any
 from urllib.parse import urljoin, urlparse, urldefrag
 from collections import defaultdict
+
 import httpx
 from bs4 import BeautifulSoup
 import asyncio
 import re
 import json
 import datetime
+import os
 
-app = FastAPI(title="AIO Pro Backend", version="1.4.0")
+
+app = FastAPI(title="AIO Pro Backend", version="1.4.1")
+
 
 # ---------- Models ----------
 
@@ -80,6 +88,8 @@ async def fetch_text(client: httpx.AsyncClient, url: str) -> Tuple[str, str]:
 async def discover_sitemaps(client: httpx.AsyncClient, root: str) -> Set[str]:
     """Try common sitemap locations + auto-discover from robots.txt."""
     found: Set[str] = set()
+
+    # robots.txt discovery
     robots_url = urljoin(root, "/robots.txt")
     _, robots = await fetch_text(client, robots_url)
     if robots:
@@ -89,11 +99,14 @@ async def discover_sitemaps(client: httpx.AsyncClient, root: str) -> Set[str]:
                 sm = normalize_url(sm)
                 if sm:
                     found.add(sm)
+
+    # common locations
     for path in SITEMAP_CANDIDATES:
         sm_url = urljoin(root, path)
         url_fetched, text = await fetch_text(client, sm_url)
         if text and len(text) > 60 and "<" in text:
             found.add(url_fetched)
+
     return found
 
 
@@ -173,16 +186,23 @@ async def crawl_site(req: CrawlRequest):
     visited: Set[str] = set()
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
+        # always include homepage
         discovered.add(start)
+
+        # sitemaps
         sitemaps = await discover_sitemaps(client, start)
         for sm in sitemaps:
             _, xml_text = await fetch_text(client, sm)
             if xml_text:
                 discovered.update(u for u in extract_urls_from_sitemap(xml_text) if same_host(u, host))
 
+        # WP REST
         discovered.update(await enumerate_wordpress(client, start, host))
+
+        # seed
         to_visit = [u for u in discovered if same_host(u, host)]
 
+        # light BFS crawl
         while to_visit and len(discovered) < max_pages:
             batch = []
             while to_visit and len(batch) < 10:
@@ -239,6 +259,7 @@ async def validate_schema(payload: Dict[str, Any] = Body(...)):
     url = payload.get("url")
     if not url:
         return {"error": "Missing 'url'."}
+    # call validator (best-effort)
     try:
         resp = httpx.post(
             "https://validator.schema.org/validate",
@@ -247,19 +268,24 @@ async def validate_schema(payload: Dict[str, Any] = Body(...)):
         )
         data = resp.json()
     except Exception as e:
-        return {"error": str(e)}
+        data = {"error": str(e)}
 
+    # local detection for reliability
     try:
         html = fetch_html(url)
         blocks = extract_json_ld(html)
         types = [b.get("@type") for b in blocks if "@type" in b]
-        eligible = any(t in ["Article", "Product", "FAQPage", "VideoObject", "LocalBusiness"] for t in types)
+        # if any structured type present, treat as “eligible candidate”
+        eligible = any(
+            t in ["Article", "BlogPosting", "Product", "FAQPage", "VideoObject", "LocalBusiness", "Organization", "Service"]
+            for t in (types if isinstance(types, list) else [])
+        )
     except Exception:
         types, eligible = [], False
 
     return {
         "url": url,
-        "eligible_for_rich_results": eligible,
+        "eligible_for_rich_results": bool(eligible),
         "detected_types": types,
         "raw": data
     }
@@ -274,7 +300,8 @@ async def ai_snippet_simulate(payload: Dict[str, Any] = Body(...)):
     soup = BeautifulSoup(html, "html.parser")
 
     title = soup.title.string if soup.title else ""
-    h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+    h1_el = soup.find("h1")
+    h1 = h1_el.get_text(strip=True) if h1_el else ""
     meta = soup.find("meta", attrs={"name": "description"})
     desc = meta["content"] if meta and meta.get("content") else ""
 
@@ -310,19 +337,25 @@ async def auto_audit(payload: Dict[str, Any] = Body(...)):
             html = fetch_html(url, timeout=45)
             blocks = extract_json_ld(html)
             types = [b.get("@type") for b in blocks if "@type" in b]
-            eligible = any(t in ["Article", "Product", "FAQPage", "VideoObject", "LocalBusiness"] for t in types)
+            eligible = any(
+                t in ["Article", "BlogPosting", "Product", "FAQPage", "VideoObject", "LocalBusiness", "Organization", "Service"]
+                for t in (types if isinstance(types, list) else [])
+            )
             page.update({
                 "schema_types": types,
                 "eligible_for_rich_results": bool(eligible),
             })
+
             soup = BeautifulSoup(html, "html.parser")
             title = soup.title.string if soup.title else ""
-            h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+            h1_el = soup.find("h1")
+            h1 = h1_el.get_text(strip=True) if h1_el else ""
             meta = soup.find("meta", attrs={"name": "description"})
             desc = meta["content"] if meta and meta.get("content") else ""
             snippet = f"{title} — {h1}. {desc}".strip()
             if len(snippet.split()) > 55:
                 snippet = " ".join(snippet.split()[:55]) + "…"
+
             page.update({
                 "title": title,
                 "h1": h1,
@@ -331,6 +364,7 @@ async def auto_audit(payload: Dict[str, Any] = Body(...)):
             })
         except Exception as e:
             page["error"] = str(e)
+
         pages.append(page)
 
     return {"domain": start_url, "page_count": len(pages), "pages": pages}
@@ -339,8 +373,11 @@ async def auto_audit(payload: Dict[str, Any] = Body(...)):
 # ---------- REPAIR SCHEMA ENDPOINT ----------
 
 JSONLD_CONTEXT = "https://schema.org"
-PREFERRED_ENTITIES = ["LocalBusiness", "Organization", "WebSite", "WebPage", "Article",
-                      "BlogPosting", "FAQPage", "Service", "Product", "VideoObject", "BreadcrumbList"]
+PREFERRED_ENTITIES = [
+    "LocalBusiness", "Organization", "WebSite", "WebPage",
+    "Article", "BlogPosting", "FAQPage", "Service", "Product",
+    "VideoObject", "BreadcrumbList"
+]
 
 
 def _strip_nones(obj):
@@ -374,8 +411,8 @@ def _collect_types(blocks):
     return types
 
 
-def _infer_recommendations(merged, detected_types):
-    recs = []
+def _infer_recommendations(merged: Dict[str, Any], detected_types: List[str]) -> List[str]:
+    recs: List[str] = []
     ts = set(detected_types)
 
     if "Article" in ts or "BlogPosting" in ts:
@@ -415,9 +452,11 @@ async def repair_schema(payload: Dict[str, Any] = Body(...)):
 
     blocks = extract_json_ld(html)
     if not blocks:
+        # Build minimal page skeleton
         soup = BeautifulSoup(html, "html.parser")
-        title = soup.title.string.strip() if soup.title and soup.title.string else ""
-        h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+        title = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+        h1_el = soup.find("h1")
+        h1 = h1_el.get_text(strip=True) if h1_el else ""
         skeleton = _ensure_context({
             "@type": ["WebPage"],
             "headline": h1 or title,
@@ -435,7 +474,10 @@ async def repair_schema(payload: Dict[str, Any] = Body(...)):
             ]
         }
 
+    # normalise contexts
     blocks = [_ensure_context(b) for b in blocks]
+
+    # group by @type
     by_type: defaultdict[str, list] = defaultdict(list)
     for b in blocks:
         tlist = _as_list(b.get("@type"))
@@ -448,34 +490,61 @@ async def repair_schema(payload: Dict[str, Any] = Body(...)):
     detected_types = _collect_types(blocks)
     merged_root: Dict[str, Any] = {"@context": JSONLD_CONTEXT}
 
-    # Prefer LocalBusiness > Organization
+    # Identity (prefer LocalBusiness > Organization)
     identity = by_type.get("LocalBusiness", [None])[0] or by_type.get("Organization", [None])[0]
     if identity:
-        keep_keys = {"@type", "name", "url", "logo", "sameAs", "address", "telephone", "email"}
+        keep_keys = {"@type", "name", "url", "logo", "sameAs", "address", "telephone", "email", "contactPoint"}
         merged_root.update({k: identity.get(k) for k in keep_keys if identity.get(k)})
 
-    if by_type.get("WebPage"):
-        wp = by_type["WebPage"][0]
-        keep_wp = {"@type", "name", "headline", "inLanguage"}
-        merged_root["webPage"] = {k: wp.get(k) for k in keep_wp if wp.get(k)}
-
+    # WebSite
     if by_type.get("WebSite"):
         ws = by_type["WebSite"][0]
-        keep_ws = {"@type", "name", "url", "potentialAction"}
+        keep_ws = {"@type", "name", "url", "potentialAction", "inLanguage"}
         merged_root["webSite"] = {k: ws.get(k) for k in keep_ws if ws.get(k)}
 
+    # WebPage
+    if by_type.get("WebPage"):
+        wp = by_type["WebPage"][0]
+        keep_wp = {"@type", "name", "headline", "about", "primaryImageOfPage", "breadcrumb", "inLanguage"}
+        merged_root["webPage"] = {k: wp.get(k) for k in keep_wp if wp.get(k)}
+
+    # Article / BlogPosting (prefer BlogPosting)
+    post = None
     if by_type.get("BlogPosting"):
         post = by_type["BlogPosting"][0]
-        keep_post = {"@type", "headline", "description", "author", "datePublished", "image"}
+        post["@type"] = "BlogPosting"
+    elif by_type.get("Article"):
+        post = by_type["Article"][0]
+        post["@type"] = "Article"
+    if post:
+        keep_post = {
+            "@type", "headline", "name", "description", "author",
+            "datePublished", "dateModified", "image", "mainEntityOfPage", "articleSection"
+        }
         merged_root["primaryContent"] = {k: post.get(k) for k in keep_post if post.get(k)}
 
+    # FAQPage
     if by_type.get("FAQPage"):
         faq = by_type["FAQPage"][0]
         if "mainEntity" in faq:
             merged_root["faq"] = {"@type": "FAQPage", "mainEntity": faq["mainEntity"]}
 
+    # VideoObject
+    if by_type.get("VideoObject"):
+        vid = by_type["VideoObject"][0]
+        keep_vid = {"@type", "name", "description", "thumbnailUrl", "uploadDate", "embedUrl", "contentUrl", "transcript"}
+        merged_root["video"] = {k: vid.get(k) for k in keep_vid if vid.get(k)}
+
+    # BreadcrumbList
+    if by_type.get("BreadcrumbList"):
+        bc = by_type["BreadcrumbList"][0]
+        if "itemListElement" in bc:
+            merged_root["breadcrumbs"] = {"@type": "BreadcrumbList", "itemListElement": bc["itemListElement"]}
+
+    # Clean + ensure context
     merged_root = _ensure_context(_strip_nones(merged_root))
 
+    # Try remote validation (best-effort)
     validation_summary = "Merged OK."
     try:
         resp = httpx.post(
@@ -483,13 +552,31 @@ async def repair_schema(payload: Dict[str, Any] = Body(...)):
             json={"raw": json.dumps(merged_root, ensure_ascii=False), "validationMode": "all"},
             timeout=60
         )
-        jd = resp.json()
-        errs =
-# --- Serve static and plugin files ---
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import os
+        jd = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
+        errs: List[str] = []
+        for item in _as_list(jd.get("errors")):
+            msg = (item.get("message") or item.get("error") or "").strip()
+            if msg:
+                errs.append(msg)
+        if errs:
+            validation_summary = f"Validator warnings/errors: {len(errs)} issue(s). First: {errs[0][:200]}"
+    except Exception:
+        # keep silent if validator unreachable
+        pass
+
+    # Recommendations
+    content_recs = _infer_recommendations(merged_root, detected_types)
+
+    return {
+        "url": url,
+        "invalid_types": [t for t in by_type.keys() if t not in PREFERRED_ENTITIES and t != "_unknown"],
+        "merged_jsonld": json.dumps(merged_root, ensure_ascii=False),
+        "validation_summary": validation_summary,
+        "content_recommendations": content_recs
+    }
+
+
+# ---------- Static files & plugin helpers ----------
 
 app.add_middleware(
     CORSMiddleware,
@@ -499,17 +586,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# serve /static (for logo.png)
+# /static (for logo etc.)
 if not os.path.isdir("static"):
     os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# serve /.well-known/ai-plugin.json
+# /.well-known/ai-plugin.json
 @app.get("/.well-known/ai-plugin.json", include_in_schema=False)
 async def serve_plugin_manifest():
     return FileResponse(".well-known/ai-plugin.json", media_type="application/json")
 
-# serve /openapi.yaml
+# /openapi.yaml (the spec you paste into the GPT “Actions”)
 @app.get("/openapi.yaml", include_in_schema=False)
 async def serve_openapi_yaml():
     return FileResponse("aio-pro-backend.yaml", media_type="text/yaml")
