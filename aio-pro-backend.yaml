@@ -1,0 +1,284 @@
+openapi: 3.1.0
+info:
+  title: AIO Pro Backend API
+  version: 1.4.1
+  description: |
+    AIO Pro Backend powers GPT-based AI visibility audits, schema validation, and content repair.
+    It crawls a website, validates its structured data, simulates AI snippets, and recommends content or schema fixes.
+servers:
+  - url: https://aio-pro-backend.onrender.com
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: Service health status
+  /crawl_site:
+    post:
+      summary: Crawl a website and extract internal links
+      operationId: crawl_site
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                start_url:
+                  type: string
+                  format: uri
+                  example: https://roofmasterschristchurch.co.nz/
+                max_pages:
+                  type: integer
+                  example: 50
+      responses:
+        "200":
+          description: Crawl results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  link_count:
+                    type: integer
+                  links:
+                    type: array
+                    items:
+                      type: string
+  /validate_schema:
+    post:
+      summary: Validate schema.org markup on a given page
+      operationId: validate_schema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: https://roofmasterschristchurch.co.nz/
+      responses:
+        "200":
+          description: Validation results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  eligible_for_rich_results:
+                    type: boolean
+                  detected_types:
+                    type: array
+                    items:
+                      type: string
+                  raw:
+                    type: object
+  /ai_snippet_simulate:
+    post:
+      summary: Simulate AI-generated search snippet from page content
+      operationId: ai_snippet_simulate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Simulated snippet and schema recommendations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  title:
+                    type: string
+                  h1:
+                    type: string
+                  ai_snippet_simulation:
+                    type: string
+                  recommended_schema_types:
+                    type: array
+                    items:
+                      type: string
+  /auto_audit:
+    post:
+      summary: Run a full AI Visibility Audit
+      operationId: auto_audit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                start_url:
+                  type: string
+                  format: uri
+                max_pages:
+                  type: integer
+                  example: 30
+      responses:
+        "200":
+          description: Combined audit results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  domain:
+                    type: string
+                  page_count:
+                    type: integer
+                  pages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        url:
+                          type: string
+                        title:
+                          type: string
+                        h1:
+                          type: string
+                        schema_types:
+                          type: array
+                          items:
+                            type: string
+                        eligible_for_rich_results:
+                          type: boolean
+                        ai_snippet_simulation:
+                          type: string
+                        recommended_schema_types:
+                          type: array
+                          items:
+                            type: string
+  /fetch_page:
+    post:
+      summary: Fetch full content and signals from a single page
+      operationId: fetch_page
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Page structure and content insights
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  title:
+                    type: string
+                  h1:
+                    type: string
+                  meta_description:
+                    type: string
+                  headings:
+                    type: array
+                    items:
+                      type: string
+                  word_count:
+                    type: integer
+                  links:
+                    type: object
+                    properties:
+                      internal:
+                        type: integer
+                      external:
+                        type: integer
+                  images:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        url:
+                          type: string
+                        alt:
+                          type: string
+                  videos:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        embedUrl:
+                          type: string
+                        title:
+                          type: string
+                  faqs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        question:
+                          type: string
+                        answer:
+                          type: string
+                  jsonld_detected:
+                    type: array
+                    items:
+                      type: object
+                  fetched_at:
+                    type: string
+  /repair_schema:
+    post:
+      summary: Merge and repair schema.org markup from a page
+      operationId: repair_schema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Repaired and unified JSON-LD block
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                  invalid_types:
+                    type: array
+                    items:
+                      type: string
+                  merged_jsonld:
+                    type: string
+                  validation_summary:
+                    type: string
+                  content_recommendations:
+                    type: array
+                    items:
+                      type: string
+components:
+  schemas: {}
