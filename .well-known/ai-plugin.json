@@ -2,8 +2,8 @@
   "schema_version": "v1",
   "name_for_human": "AIO Pro Backend",
   "name_for_model": "aio_pro_backend",
-  "description_for_human": "Run AI visibility audits, crawl sites, validate schema, and repair structured data automatically.",
-  "description_for_model": "Provides access to endpoints for crawling a website, extracting content, validating and merging schema.org JSON-LD, and generating AI-driven content recommendations for SEO and search visibility.",
+  "description_for_human": "Run AI visibility audits, crawl sites, validate/repair schema, and simulate AI snippets.",
+  "description_for_model": "Provides endpoints for crawling a website, extracting content signals, validating and merging schema.org JSON-LD, simulating AI-generated snippets, and generating recommendations for schema or content fixes.",
   "auth": { "type": "none" },
   "api": {
     "type": "openapi",
