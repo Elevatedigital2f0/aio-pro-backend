@@ -287,3 +287,68 @@ async def ai_snippet_simulate(payload: Dict[str, Any] = Body(...)):
         "ai_snippet_simulation": snippet,
         "recommended_schema_types": ["WebPage", "BreadcrumbList", "Organization"]
     }
+# ---------- /auto_audit ----------
+@app.post("/auto_audit")
+async def auto_audit(payload: Dict[str, Any] = Body(...)):
+    """
+    Perform a full AI Visibility Audit:
+    1. Crawl site
+    2. Validate schema for each page
+    3. Simulate AI snippet
+    Returns unified dataset for GPT scoring.
+    """
+    start_url = payload.get("start_url")
+    max_pages = payload.get("max_pages", 30)
+    if not start_url:
+        return {"error": "Missing 'start_url'."}
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=45) as client:
+        # Step 1: Crawl site
+        crawl_resp = await client.post(
+            "https://aio-pro-backend.onrender.com/crawl_site",
+            json={"start_url": start_url, "max_pages": max_pages},
+        )
+        if crawl_resp.status_code != 200:
+            return {"error": f"Crawl failed: {crawl_resp.text}"}
+        crawl_data = crawl_resp.json()
+        links = crawl_data.get("links", [])[:max_pages]
+
+        pages = []
+        # Step 2–3: For each page, validate schema and simulate AI snippet
+        for url in links:
+            page_result = {"url": url}
+            try:
+                val_resp = await client.post(
+                    "https://aio-pro-backend.onrender.com/validate_schema",
+                    json={"url": url},
+                )
+                val_data = val_resp.json() if val_resp.status_code == 200 else {}
+                page_result.update({
+                    "schema_types": val_data.get("detected_types", []),
+                    "eligible_for_rich_results": val_data.get("eligible_for_rich_results", False),
+                })
+            except Exception as e:
+                page_result["schema_error"] = str(e)
+
+            try:
+                snippet_resp = await client.post(
+                    "https://aio-pro-backend.onrender.com/ai_snippet_simulate",
+                    json={"url": url},
+                )
+                snippet_data = snippet_resp.json() if snippet_resp.status_code == 200 else {}
+                page_result.update({
+                    "title": snippet_data.get("title", ""),
+                    "h1": snippet_data.get("h1", ""),
+                    "ai_snippet_simulation": snippet_data.get("ai_snippet_simulation", ""),
+                    "recommended_schema_types": snippet_data.get("recommended_schema_types", []),
+                })
+            except Exception as e:
+                page_result["snippet_error"] = str(e)
+
+            pages.append(page_result)
+
+    return {
+        "domain": start_url,
+        "page_count": len(pages),
+        "pages": pages,
+    }
