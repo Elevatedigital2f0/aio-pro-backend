@@ -1,0 +1,15 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "AIO Pro Backend",
+  "name_for_model": "aio_pro_backend",
+  "description_for_human": "Run AI visibility audits, crawl sites, validate schema, and repair structured data automatically.",
+  "description_for_model": "Provides access to endpoints for crawling a website, extracting content, validating and merging schema.org JSON-LD, and generating AI-driven content recommendations for SEO and search visibility.",
+  "auth": { "type": "none" },
+  "api": {
+    "type": "openapi",
+    "url": "https://aio-pro-backend.onrender.com/openapi.yaml"
+  },
+  "logo_url": "https://aio-pro-backend.onrender.com/static/logo.png",
+  "contact_email": "support@aio-pro.co.nz",
+  "legal_info_url": "https://aio-pro.co.nz/legal"
+}
