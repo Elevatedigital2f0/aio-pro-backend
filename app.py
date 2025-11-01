@@ -2,13 +2,15 @@ from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, HttpUrl
 from typing import List, Set, Tuple, Dict, Any
 from urllib.parse import urljoin, urlparse, urldefrag
+from collections import defaultdict
 import httpx
 from bs4 import BeautifulSoup
 import asyncio
 import re
 import json
+import datetime
 
-app = FastAPI(title="AIO Pro Backend", version="1.3.2")
+app = FastAPI(title="AIO Pro Backend", version="1.4.0")
 
 # ---------- Models ----------
 
@@ -68,7 +70,7 @@ def absolutize(base: str, maybe_relative: str) -> str:
 async def fetch_text(client: httpx.AsyncClient, url: str) -> Tuple[str, str]:
     """Return (url, text or '') with soft error handling."""
     try:
-        r = await client.get(url, headers=DEFAULT_HEADERS, timeout=15)
+        r = await client.get(url, headers=DEFAULT_HEADERS, timeout=30)
         r.raise_for_status()
         return url, r.text
     except Exception:
@@ -134,7 +136,7 @@ async def enumerate_wordpress(client: httpx.AsyncClient, root: str, host: str) -
     for endpoint in (WORDPRESS_REST_PAGES, WORDPRESS_REST_POSTS):
         url = urljoin(root, endpoint)
         try:
-            r = await client.get(url, headers=DEFAULT_HEADERS, timeout=15)
+            r = await client.get(url, headers=DEFAULT_HEADERS, timeout=30)
             if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/json"):
                 data = r.json()
                 if isinstance(data, list):
@@ -149,7 +151,7 @@ async def enumerate_wordpress(client: httpx.AsyncClient, root: str, host: str) -
     return urls
 
 
-# ---------- Routes ----------
+# ---------- ROUTES ----------
 
 @app.get("/health")
 async def health():
@@ -210,7 +212,7 @@ async def crawl_site(req: CrawlRequest):
     return CrawlResult(url=start, link_count=len(final_links), links=final_links)
 
 
-# ---------- NEW FEATURES: Schema Validator + AI Snippet Simulation ----------
+# ---------- SCHEMA VALIDATION + SNIPPET SIM ----------
 
 def fetch_html(url: str, timeout: int = 30) -> str:
     headers = {"User-Agent": "Mozilla/5.0 (AIO-Pro/1.0)"}
@@ -287,196 +289,199 @@ async def ai_snippet_simulate(payload: Dict[str, Any] = Body(...)):
         "ai_snippet_simulation": snippet,
         "recommended_schema_types": ["WebPage", "BreadcrumbList", "Organization"]
     }
-# ---------- /auto_audit ----------
+
+
+# ---------- AUTO AUDIT (LOCAL EXECUTION) ----------
+
 @app.post("/auto_audit")
 async def auto_audit(payload: Dict[str, Any] = Body(...)):
-    """
-    Perform a full AI Visibility Audit:
-    1. Crawl site
-    2. Validate schema for each page
-    3. Simulate AI snippet
-    Returns unified dataset for GPT scoring.
-    """
     start_url = payload.get("start_url")
-    max_pages = payload.get("max_pages", 30)
+    max_pages = int(payload.get("max_pages", 30))
     if not start_url:
         return {"error": "Missing 'start_url'."}
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=45) as client:
-        # Step 1: Crawl site
-        crawl_resp = await client.post(
-            "https://aio-pro-backend.onrender.com/crawl_site",
-            json={"start_url": start_url, "max_pages": max_pages},
-        )
-        if crawl_resp.status_code != 200:
-            return {"error": f"Crawl failed: {crawl_resp.text}"}
-        crawl_data = crawl_resp.json()
-        links = crawl_data.get("links", [])[:max_pages]
+    crawl_out = await crawl_site(CrawlRequest(start_url=start_url, max_pages=max_pages))
+    links = list(crawl_out.links)[:max_pages]
+    pages = []
 
-        pages = []
-        # Step 2–3: For each page, validate schema and simulate AI snippet
-        for url in links:
-            page_result = {"url": url}
-            try:
-                val_resp = await client.post(
-                    "https://aio-pro-backend.onrender.com/validate_schema",
-                    json={"url": url},
-                )
-                val_data = val_resp.json() if val_resp.status_code == 200 else {}
-                page_result.update({
-                    "schema_types": val_data.get("detected_types", []),
-                    "eligible_for_rich_results": val_data.get("eligible_for_rich_results", False),
-                })
-            except Exception as e:
-                page_result["schema_error"] = str(e)
-
-            try:
-                snippet_resp = await client.post(
-                    "https://aio-pro-backend.onrender.com/ai_snippet_simulate",
-                    json={"url": url},
-                )
-                snippet_data = snippet_resp.json() if snippet_resp.status_code == 200 else {}
-                page_result.update({
-                    "title": snippet_data.get("title", ""),
-                    "h1": snippet_data.get("h1", ""),
-                    "ai_snippet_simulation": snippet_data.get("ai_snippet_simulation", ""),
-                    "recommended_schema_types": snippet_data.get("recommended_schema_types", []),
-                })
-            except Exception as e:
-                page_result["snippet_error"] = str(e)
-
-            pages.append(page_result)
-
-    return {
-        "domain": start_url,
-        "page_count": len(pages),
-        "pages": pages,
-    }
-# --- CONTENT INSPECTION ENDPOINTS -------------------------------------------
-from fastapi import Body
-from typing import Dict, Any, List, Optional
-import datetime
-
-def _text_or_none(x):
-    return (x or "").strip() or None
-
-def _first(el):
-    return el[0] if el else None
-
-def _absolute(base, url):
-    try:
-        return urljoin(base, url)
-    except Exception:
-        return url
-
-def extract_faq_pairs(soup: BeautifulSoup) -> List[Dict[str, str]]:
-    """Naive FAQ discovery: heading that looks like a question + following paragraph/list."""
-    faqs = []
-    for h in soup.find_all(["h2","h3","h4"]):
-        q = (h.get_text(" ", strip=True) or "")
-        if q.endswith("?") and len(q) > 8:
-            # crawl siblings until a non-text block; keep first paragraph/list as answer
-            ans = []
-            for sib in h.find_all_next(limit=8):
-                if sib.name in ["p","ul","ol"]:
-                    ans.append(sib.get_text(" ", strip=True))
-                    if len(" ".join(ans)) > 40:
-                        break
-                if sib.name in ["h2","h3","h4"]:
-                    break
-            a = " ".join(ans).strip()
-            if a:
-                faqs.append({"question": q, "answer": a})
-    return faqs
-
-def extract_video_embeds(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
-    vids = []
-    # YouTube / Vimeo iframes
-    for ifr in soup.find_all("iframe", src=True):
-        src = ifr.get("src")
-        if any(host in src for host in ["youtube.com", "youtu.be", "player.vimeo.com"]):
-            vids.append({
-                "embedUrl": _absolute(base_url, src),
-                "title": _text_or_none(ifr.get("title")),
-                "width": _text_or_none(ifr.get("width")),
-                "height": _text_or_none(ifr.get("height")),
+    for url in links:
+        page = {"url": url}
+        try:
+            html = fetch_html(url, timeout=45)
+            blocks = extract_json_ld(html)
+            types = [b.get("@type") for b in blocks if "@type" in b]
+            eligible = any(t in ["Article", "Product", "FAQPage", "VideoObject", "LocalBusiness"] for t in types)
+            page.update({
+                "schema_types": types,
+                "eligible_for_rich_results": bool(eligible),
             })
-    # HTML5 <video>
-    for v in soup.find_all("video"):
-        src = v.get("src") or _first([s.get("src") for s in v.find_all("source", src=True)])
-        if src:
-            vids.append({"embedUrl": _absolute(base_url, src)})
-    return vids
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.title.string if soup.title else ""
+            h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+            meta = soup.find("meta", attrs={"name": "description"})
+            desc = meta["content"] if meta and meta.get("content") else ""
+            snippet = f"{title} — {h1}. {desc}".strip()
+            if len(snippet.split()) > 55:
+                snippet = " ".join(snippet.split()[:55]) + "…"
+            page.update({
+                "title": title,
+                "h1": h1,
+                "ai_snippet_simulation": snippet,
+                "recommended_schema_types": ["WebPage", "BreadcrumbList", "Organization"]
+            })
+        except Exception as e:
+            page["error"] = str(e)
+        pages.append(page)
 
-def extract_images(soup: BeautifulSoup, base_url: str) -> List[Dict[str,str]]:
-    imgs = []
-    # Prefer og:image first
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        imgs.append({"url": _absolute(base_url, og["content"]), "alt": None})
-    for im in soup.find_all("img", src=True):
-        imgs.append({
-            "url": _absolute(base_url, im.get("src")),
-            "alt": _text_or_none(im.get("alt"))
-        })
-    return imgs
+    return {"domain": start_url, "page_count": len(pages), "pages": pages}
 
-@app.post("/fetch_page")
-async def fetch_page(payload: Dict[str, Any] = Body(...)):
-    """
-    Returns text signals the GPT can use to choose schema and content fixes.
-    payload: { "url": "<page url>" }
-    """
+
+# ---------- REPAIR SCHEMA ENDPOINT ----------
+
+JSONLD_CONTEXT = "https://schema.org"
+PREFERRED_ENTITIES = ["LocalBusiness", "Organization", "WebSite", "WebPage", "Article",
+                      "BlogPosting", "FAQPage", "Service", "Product", "VideoObject", "BreadcrumbList"]
+
+
+def _strip_nones(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_nones(v) for k, v in obj.items() if v not in (None, "", [], {}, "null")}
+    if isinstance(obj, list):
+        return [_strip_nones(v) for v in obj if v not in (None, "", [], {}, "null")]
+    return obj
+
+
+def _ensure_context(block):
+    if "@context" not in block:
+        block["@context"] = JSONLD_CONTEXT
+    return block
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _collect_types(blocks):
+    types = []
+    for b in blocks:
+        t = b.get("@type")
+        if isinstance(t, list):
+            types.extend(t)
+        elif isinstance(t, str):
+            types.append(t)
+    return types
+
+
+def _infer_recommendations(merged, detected_types):
+    recs = []
+    ts = set(detected_types)
+
+    if "Article" in ts or "BlogPosting" in ts:
+        if not merged.get("author"):
+            recs.append("Add 'author' (Person) with name and profile URL.")
+        if "datePublished" not in merged or "dateModified" not in merged:
+            recs.append("Add 'datePublished' and 'dateModified'.")
+    if "Service" in ts:
+        if "offers" not in merged:
+            recs.append("Add 'offers' with priceRange or Offer details.")
+        if "areaServed" not in merged:
+            recs.append("Add 'areaServed' for GEO targeting.")
+    if "LocalBusiness" in ts or "Organization" in ts:
+        if "sameAs" not in merged:
+            recs.append("Add 'sameAs' with official social profiles.")
+        if "contactPoint" not in merged:
+            recs.append("Add 'contactPoint' with phone and contactType.")
+    if "FAQPage" not in ts:
+        recs.append("Consider adding FAQPage for answer-first snippets.")
+    if "VideoObject" not in ts:
+        recs.append("Add VideoObject with transcript for SGE trust.")
+    if "BreadcrumbList" not in ts:
+        recs.append("Add BreadcrumbList for context and sitelinks.")
+    return recs
+
+
+@app.post("/repair_schema")
+async def repair_schema(payload: Dict[str, Any] = Body(...)):
     url = payload.get("url")
     if not url:
         return {"error": "Missing 'url'."}
+
     try:
-        html = fetch_html(url, timeout=45)
+        html = fetch_html(url)
     except Exception as e:
         return {"error": f"Fetch failed: {e}"}
 
-    soup = BeautifulSoup(html, "html.parser")
+    blocks = extract_json_ld(html)
+    if not blocks:
+        soup = BeautifulSoup(html, "html.parser")
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        h1 = soup.find("h1").get_text(strip=True) if soup.find("h1") else ""
+        skeleton = _ensure_context({
+            "@type": ["WebPage"],
+            "headline": h1 or title,
+            "name": title or h1,
+            "url": url
+        })
+        return {
+            "url": url,
+            "invalid_types": [],
+            "merged_jsonld": json.dumps(skeleton, ensure_ascii=False),
+            "validation_summary": "No JSON-LD found — created minimal WebPage schema.",
+            "content_recommendations": [
+                "Add Organization/LocalBusiness schema.",
+                "Add Service, Article, or FAQPage schema as relevant."
+            ]
+        }
 
-    title = _text_or_none(soup.title.string if soup.title else None)
-    h1_el = soup.find("h1")
-    h1 = _text_or_none(h1_el.get_text(" ", strip=True) if h1_el else None)
-    meta_desc_tag = soup.find("meta", attrs={"name":"description"})
-    meta_desc = _text_or_none(meta_desc_tag.get("content") if meta_desc_tag else None)
+    blocks = [_ensure_context(b) for b in blocks]
+    by_type: defaultdict[str, list] = defaultdict(list)
+    for b in blocks:
+        tlist = _as_list(b.get("@type"))
+        if not tlist:
+            by_type["_unknown"].append(b)
+        else:
+            for t in tlist:
+                by_type[t].append(b)
 
-    # Headings & copy
-    headings = [h.get_text(" ", strip=True) for h in soup.find_all(["h1","h2","h3"])]
-    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-    word_count = sum(len(p.split()) for p in paragraphs)
+    detected_types = _collect_types(blocks)
+    merged_root: Dict[str, Any] = {"@context": JSONLD_CONTEXT}
 
-    # Links
-    internal = external = 0
-    host = urlparse(url).netloc
-    for a in soup.find_all("a", href=True):
-        href = normalize_url(_absolute(url, a["href"]))
-        if not href:
-            continue
-        internal += 1 if urlparse(href).netloc == host else 0
-        external += 1 if urlparse(href).netloc != host else 0
+    # Prefer LocalBusiness > Organization
+    identity = by_type.get("LocalBusiness", [None])[0] or by_type.get("Organization", [None])[0]
+    if identity:
+        keep_keys = {"@type", "name", "url", "logo", "sameAs", "address", "telephone", "email"}
+        merged_root.update({k: identity.get(k) for k in keep_keys if identity.get(k)})
 
-    # Media/FAQ
-    videos = extract_video_embeds(soup, url)
-    images = extract_images(soup, url)
-    faqs = extract_faq_pairs(soup)
+    if by_type.get("WebPage"):
+        wp = by_type["WebPage"][0]
+        keep_wp = {"@type", "name", "headline", "inLanguage"}
+        merged_root["webPage"] = {k: wp.get(k) for k in keep_wp if wp.get(k)}
 
-    # JSON-LD blocks already on page (for merge/avoid duplicates)
-    json_ld = extract_json_ld(html)
+    if by_type.get("WebSite"):
+        ws = by_type["WebSite"][0]
+        keep_ws = {"@type", "name", "url", "potentialAction"}
+        merged_root["webSite"] = {k: ws.get(k) for k in keep_ws if ws.get(k)}
 
-    return {
-        "url": url,
-        "title": title,
-        "h1": h1,
-        "meta_description": meta_desc,
-        "headings": headings[:40],
-        "word_count": word_count,
-        "links": {"internal": internal, "external": external},
-        "images": images[:30],
-        "videos": videos[:10],
-        "faqs": faqs[:15],
-        "jsonld_detected": json_ld,
-        "fetched_at": datetime.datetime.utcnow().isoformat() + "Z"
-    }
+    if by_type.get("BlogPosting"):
+        post = by_type["BlogPosting"][0]
+        keep_post = {"@type", "headline", "description", "author", "datePublished", "image"}
+        merged_root["primaryContent"] = {k: post.get(k) for k in keep_post if post.get(k)}
+
+    if by_type.get("FAQPage"):
+        faq = by_type["FAQPage"][0]
+        if "mainEntity" in faq:
+            merged_root["faq"] = {"@type": "FAQPage", "mainEntity": faq["mainEntity"]}
+
+    merged_root = _ensure_context(_strip_nones(merged_root))
+
+    validation_summary = "Merged OK."
+    try:
+        resp = httpx.post(
+            "https://validator.schema.org/validate",
+            json={"raw": json.dumps(merged_root, ensure_ascii=False), "validationMode": "all"},
+            timeout=60
+        )
+        jd = resp.json()
+        errs =
