@@ -352,3 +352,131 @@ async def auto_audit(payload: Dict[str, Any] = Body(...)):
         "page_count": len(pages),
         "pages": pages,
     }
+# --- CONTENT INSPECTION ENDPOINTS -------------------------------------------
+from fastapi import Body
+from typing import Dict, Any, List, Optional
+import datetime
+
+def _text_or_none(x):
+    return (x or "").strip() or None
+
+def _first(el):
+    return el[0] if el else None
+
+def _absolute(base, url):
+    try:
+        return urljoin(base, url)
+    except Exception:
+        return url
+
+def extract_faq_pairs(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    """Naive FAQ discovery: heading that looks like a question + following paragraph/list."""
+    faqs = []
+    for h in soup.find_all(["h2","h3","h4"]):
+        q = (h.get_text(" ", strip=True) or "")
+        if q.endswith("?") and len(q) > 8:
+            # crawl siblings until a non-text block; keep first paragraph/list as answer
+            ans = []
+            for sib in h.find_all_next(limit=8):
+                if sib.name in ["p","ul","ol"]:
+                    ans.append(sib.get_text(" ", strip=True))
+                    if len(" ".join(ans)) > 40:
+                        break
+                if sib.name in ["h2","h3","h4"]:
+                    break
+            a = " ".join(ans).strip()
+            if a:
+                faqs.append({"question": q, "answer": a})
+    return faqs
+
+def extract_video_embeds(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    vids = []
+    # YouTube / Vimeo iframes
+    for ifr in soup.find_all("iframe", src=True):
+        src = ifr.get("src")
+        if any(host in src for host in ["youtube.com", "youtu.be", "player.vimeo.com"]):
+            vids.append({
+                "embedUrl": _absolute(base_url, src),
+                "title": _text_or_none(ifr.get("title")),
+                "width": _text_or_none(ifr.get("width")),
+                "height": _text_or_none(ifr.get("height")),
+            })
+    # HTML5 <video>
+    for v in soup.find_all("video"):
+        src = v.get("src") or _first([s.get("src") for s in v.find_all("source", src=True)])
+        if src:
+            vids.append({"embedUrl": _absolute(base_url, src)})
+    return vids
+
+def extract_images(soup: BeautifulSoup, base_url: str) -> List[Dict[str,str]]:
+    imgs = []
+    # Prefer og:image first
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        imgs.append({"url": _absolute(base_url, og["content"]), "alt": None})
+    for im in soup.find_all("img", src=True):
+        imgs.append({
+            "url": _absolute(base_url, im.get("src")),
+            "alt": _text_or_none(im.get("alt"))
+        })
+    return imgs
+
+@app.post("/fetch_page")
+async def fetch_page(payload: Dict[str, Any] = Body(...)):
+    """
+    Returns text signals the GPT can use to choose schema and content fixes.
+    payload: { "url": "<page url>" }
+    """
+    url = payload.get("url")
+    if not url:
+        return {"error": "Missing 'url'."}
+    try:
+        html = fetch_html(url, timeout=45)
+    except Exception as e:
+        return {"error": f"Fetch failed: {e}"}
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = _text_or_none(soup.title.string if soup.title else None)
+    h1_el = soup.find("h1")
+    h1 = _text_or_none(h1_el.get_text(" ", strip=True) if h1_el else None)
+    meta_desc_tag = soup.find("meta", attrs={"name":"description"})
+    meta_desc = _text_or_none(meta_desc_tag.get("content") if meta_desc_tag else None)
+
+    # Headings & copy
+    headings = [h.get_text(" ", strip=True) for h in soup.find_all(["h1","h2","h3"])]
+    paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+    word_count = sum(len(p.split()) for p in paragraphs)
+
+    # Links
+    internal = external = 0
+    host = urlparse(url).netloc
+    for a in soup.find_all("a", href=True):
+        href = normalize_url(_absolute(url, a["href"]))
+        if not href:
+            continue
+        internal += 1 if urlparse(href).netloc == host else 0
+        external += 1 if urlparse(href).netloc != host else 0
+
+    # Media/FAQ
+    videos = extract_video_embeds(soup, url)
+    images = extract_images(soup, url)
+    faqs = extract_faq_pairs(soup)
+
+    # JSON-LD blocks already on page (for merge/avoid duplicates)
+    json_ld = extract_json_ld(html)
+
+    return {
+        "url": url,
+        "title": title,
+        "h1": h1,
+        "meta_description": meta_desc,
+        "headings": headings[:40],
+        "word_count": word_count,
+        "links": {"internal": internal, "external": external},
+        "images": images[:30],
+        "videos": videos[:10],
+        "faqs": faqs[:15],
+        "jsonld_detected": json_ld,
+        "fetched_at": datetime.datetime.utcnow().isoformat() + "Z"
+    }
