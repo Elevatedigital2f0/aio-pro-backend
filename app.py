@@ -485,3 +485,31 @@ async def repair_schema(payload: Dict[str, Any] = Body(...)):
         )
         jd = resp.json()
         errs =
+# --- Serve static and plugin files ---
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import os
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# serve /static (for logo.png)
+if not os.path.isdir("static"):
+    os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# serve /.well-known/ai-plugin.json
+@app.get("/.well-known/ai-plugin.json", include_in_schema=False)
+async def serve_plugin_manifest():
+    return FileResponse(".well-known/ai-plugin.json", media_type="application/json")
+
+# serve /openapi.yaml
+@app.get("/openapi.yaml", include_in_schema=False)
+async def serve_openapi_yaml():
+    return FileResponse("aio-pro-backend.yaml", media_type="text/yaml")
